@@ -9,12 +9,10 @@ from equi_diffpo.model.common.module_attr_mixin import ModuleAttrMixin
 from equi_diffpo.model.common.normalizer import LinearNormalizer
 from equi_diffpo.model.diffusion.mask_generator import LowdimMaskGenerator
 from equi_diffpo.policy.base_image_policy import BaseImagePolicy
-import equi_diffpo.model.vision.crop_randomizer as dmvc
 
 from equi_diffpo.model.vision.voxel_crop_randomizer import VoxelCropRandomizer
 # from diffusion_policy.model.equi.equi_conditional_unet1d import EquiDiffusionUNet
 from equi_diffpo.model.diffusion.conditional_unet1d import ConditionalUnet1D
-from equi_diffpo.model.equi.equi_obs_encoder import InHandEncoder
 
 # from diffusion_policy.model.equi.equi_conditional_unet1d_2 import D4ConditionalUnet1D
 from equi_diffpo.model.vision.voxel_rot_randomizer import VoxelRotRandomizer
@@ -71,7 +69,6 @@ class ObsEncVoxel(ModuleAttrMixin):
             self.enc_obs = CNNVoxelEncoder58(obs_channel, self.n_hidden)
         else:
             raise NotImplementedError
-        self.enc_ih = InHandEncoder(self.n_hidden).to(self.device)
 
         if crop_shape[0] == 58:
             self.voxel_crop_randomizer = VoxelCropRandomizer(
@@ -81,35 +78,23 @@ class ObsEncVoxel(ModuleAttrMixin):
             )
         self.crop_shape = crop_shape
 
-        self.ih_crop_randomizer = dmvc.CropRandomizer(
-            input_shape=(3, 84, 84),
-            crop_height=76,
-            crop_width=76,
-        )
-
     def forward(self, nobs):
         ee_pos = nobs["robot0_eef_pos"]
         obs = nobs["voxels"]
-        ih = nobs["robot0_eye_in_hand_image"]
         ee_quat = nobs["robot0_eef_quat"]
         ee_q = nobs["robot0_gripper_qpos"]
-        # B, T, C, H, W
         batch_size = obs.shape[0]
         t = obs.shape[1]
-        ih = rearrange(ih, "b t c h w -> (b t) c h w")
         obs = rearrange(obs, "b t c h w l -> (b t) c h w l")
         ee_pos = rearrange(ee_pos, "b t d -> (b t) d")
         ee_quat = rearrange(ee_quat, "b t d -> (b t) d")
         ee_q = rearrange(ee_q, "b t d -> (b t) d")
         if self.crop_shape[0] == 58:
             obs = self.voxel_crop_randomizer(obs)
-        ih = self.ih_crop_randomizer(ih)
         enc_out = self.enc_obs(obs).reshape(batch_size * t, -1)  # b d
-        ih_out = self.enc_ih(ih).reshape(batch_size * t, -1)
         features = torch.cat(
             [
                 enc_out,
-                ih_out,
                 ee_pos,
                 ee_quat,
                 ee_q,
@@ -159,7 +144,7 @@ class DiffusionUNetPolicyVoxel(BaseImagePolicy):
 
         self.enc = ObsEncVoxel(obs_shape=(obs_channel, 64, 64, 64), crop_shape=crop_shape, n_hidden=enc_n_hidden)
 
-        obs_feature_dim = enc_n_hidden * 2 + 9
+        obs_feature_dim = enc_n_hidden + 9
         global_cond_dim = obs_feature_dim * n_obs_steps
 
         self.diff = ConditionalUnet1D(
@@ -251,9 +236,6 @@ class DiffusionUNetPolicyVoxel(BaseImagePolicy):
         """
         assert "past_action" not in obs_dict  # not implemented yet
         # normalize input
-        if 'agentview_image' in obs_dict:
-            del obs_dict['agentview_image']
-        obs_dict['voxels'][:, :, 1:] /= 255.0
         nobs = self.normalizer.normalize(obs_dict)
         value = next(iter(nobs.values()))
         B, To = value.shape[:2]

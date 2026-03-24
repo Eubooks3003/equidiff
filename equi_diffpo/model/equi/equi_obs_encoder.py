@@ -134,14 +134,12 @@ class EquivariantObsEncVoxel(ModuleAttrMixin):
             self.enc_obs = EquivariantVoxelEncoder58Cyclic(obs_channel, self.n_hidden, initialize)
         else:
             self.enc_obs = EquivariantVoxelEncoder64Cyclic(obs_channel, self.n_hidden, initialize)
-        self.enc_ih = InHandEncoder(self.n_hidden).to(self.device)
         self.enc_out = nn.Linear(
             nn.FieldType(
                 self.group,
-                n_hidden * [self.group.regular_repr] # agentview
-                + n_hidden * [self.group.trivial_repr] # ih
+                n_hidden * [self.group.regular_repr] # voxel encoder
                 + 4 * [self.group.irrep(1)] # pos, rot
-                + 3 * [self.group.trivial_repr], # gripper (2), z zpos
+                + 3 * [self.group.trivial_repr], # gripper (2), z pos
             ),
             self.token_type,
         )
@@ -154,47 +152,33 @@ class EquivariantObsEncVoxel(ModuleAttrMixin):
             )
         self.crop_shape = crop_shape
 
-        self.ih_crop_randomizer = dmvc.CropRandomizer(
-            input_shape=(3, 84, 84),
-            crop_height=76,
-            crop_width=76,
-        )
-
     def get6DRotation(self, quat):
         return self.quaternion_to_sixd.forward(quat[:, [3, 0, 1, 2]])    
     
     def forward(self, nobs):
         ee_pos = nobs["robot0_eef_pos"]
-        ih = nobs["robot0_eye_in_hand_image"]
         obs = nobs["voxels"]
         obs = rearrange(obs, "b t c h w d -> b t c d w h")
         obs = torch.flip(obs, (3, 4))
 
         ee_quat = nobs["robot0_eef_quat"]
         ee_q = nobs["robot0_gripper_qpos"]
-        # B, T, C, H, W
         batch_size = obs.shape[0]
         t = obs.shape[1]
-        ih = rearrange(ih, "b t c h w -> (b t) c h w")
         obs = rearrange(obs, "b t c h w l -> (b t) c h w l")
         ee_pos = rearrange(ee_pos, "b t d -> (b t) d")
         ee_quat = rearrange(ee_quat, "b t d -> (b t) d")
         ee_q = rearrange(ee_q, "b t d -> (b t) d")
         if self.crop_shape[0] == 58:
             obs = self.voxel_crop_randomizer(obs)
-        ih = self.ih_crop_randomizer(ih)
         ee_rot = self.get6DRotation(ee_quat)
         enc_out = self.enc_obs(obs).tensor.reshape(batch_size * t, -1)  # b d
-        ih_out = self.enc_ih(ih)
         pos_xy = ee_pos[:, 0:2]
         pos_z = ee_pos[:, 2:3]
         features = torch.cat(
             [
                 enc_out,
-                ih_out,
                 pos_xy,
-                # ee_rot is the first two rows of the rotation matrix (i.e., the rotation 6D repr.)
-                # each column vector in the first two rows of the rotation 6d forms a rho1 vector
                 ee_rot[:, 0:1],
                 ee_rot[:, 3:4],
                 ee_rot[:, 1:2],

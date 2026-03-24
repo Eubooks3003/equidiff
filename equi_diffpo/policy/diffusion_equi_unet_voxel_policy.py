@@ -199,10 +199,6 @@ class DiffusionEquiUNetPolicyVoxel(BaseImagePolicy):
         """
         assert 'past_action' not in obs_dict # not implemented yet
         # normalize input
-        # TODO:
-        if 'agentview_image' in obs_dict:
-            del obs_dict['agentview_image']
-        obs_dict['voxels'][:, :, 1:] /= 255.0
         nobs = self.normalizer.normalize(obs_dict)
         value = next(iter(nobs.values()))
         B, To = value.shape[:2]

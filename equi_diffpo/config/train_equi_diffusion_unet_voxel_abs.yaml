@@ -16,8 +16,8 @@ n_action_steps: 8
 n_latency_steps: 0
 dataset_obs_steps: ${n_obs_steps}
 past_action_visible: False
-# dataset: equi_diffpo.dataset.robomimic_replay_image_sym_dataset.RobomimicReplayImageSymDataset
-dataset_path: data/robomimic/datasets/${task_name}/${task_name}_voxel_abs.hdf5
+dataset_path: /home/ellina/Desktop/data/3D-DLP-mimicgen-data/core/${task_name}.hdf5
+voxel_cache_dir: /home/ellina/Desktop/data/3D-DLP-mimicgen-data/${task_name}/voxel_cache
 
 policy:
   _target_: equi_diffpo.policy.diffusion_equi_unet_voxel_policy.DiffusionEquiUNetPolicyVoxel
@@ -47,6 +47,7 @@ policy:
   n_groups: 8
   cond_predict_scale: True
   rot_aug: True
+  depth: false
 
   # scheduler.step params
   # predict_epsilon: True
