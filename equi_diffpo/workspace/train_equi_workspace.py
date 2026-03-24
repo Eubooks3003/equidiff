@@ -48,7 +48,10 @@ class TrainEquiWorkspace(BaseWorkspace):
 
         self.ema_model: BaseImagePolicy = None
         if cfg.training.use_ema:
-            self.ema_model = copy.deepcopy(self.model)
+            # Re-instantiate instead of deepcopy to avoid escnn GroupElement
+            # serialization issues (GroupElement objects don't survive deepcopy)
+            self.ema_model = hydra.utils.instantiate(cfg.policy)
+            self.ema_model.load_state_dict(self.model.state_dict())
 
         # configure training state
         self.optimizer = self.model.get_optimizer(**cfg.optimizer)
