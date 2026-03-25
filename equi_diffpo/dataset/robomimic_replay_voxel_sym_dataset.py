@@ -150,9 +150,11 @@ class RobomimicReplayVoxelSymDataset(BaseImageDataset):
                         'values': data['values'],
                         'shape': data['shape'],
                     }
-        print(f'Preloaded {len(voxel_ram_cache)} voxel frames into RAM.')
+        max_sparse_pts = max(d['coords'].shape[0] for d in voxel_ram_cache.values())
+        print(f'Preloaded {len(voxel_ram_cache)} voxel frames into RAM (max {max_sparse_pts} pts/frame).')
 
         self.voxel_ram_cache = voxel_ram_cache
+        self.max_sparse_pts = max_sparse_pts
         self.replay_buffer = replay_buffer
         self.sampler = sampler
         self.shape_meta = shape_meta
@@ -176,36 +178,18 @@ class RobomimicReplayVoxelSymDataset(BaseImageDataset):
         frame_idx = int(global_idx - self.episode_starts_arr[episode_idx])
         return episode_idx, frame_idx
 
-    def _load_voxel(self, demo_id, frame_id):
-        """Convert cached sparse voxel data to dense grid.
+    def _load_voxel_sparse(self, demo_id, frame_id):
+        """Load sparse voxel data from RAM cache.
 
-        Returns torch.Tensor of shape [C, target_size, target_size, target_size] float32.
+        Returns (coords [N, 3] int16, values [N, 3] float16, src_size int).
         """
         data = self.voxel_ram_cache.get((demo_id, frame_id))
         if data is None:
-            # Fallback to disk (shouldn't happen if preload worked)
             path = os.path.join(
                 self.voxel_cache_dir, 'voxel',
                 f'demo_{demo_id}', f'frame{frame_id}_voxels.pt')
             data = torch.load(path, weights_only=False, map_location='cpu')
-
-        coords = data['coords']
-        values = data['values']
-        src_size = int(data['shape'][1])
-
-        # Reconstruct dense grid
-        s = self.voxel_target_size
-        grid = torch.zeros(3, s, s, s)
-        if s < src_size:
-            # Build at src resolution, then downsample
-            full = torch.zeros(3, src_size, src_size, src_size)
-            full[:, coords[:, 0].long(), coords[:, 1].long(), coords[:, 2].long()] = values.T.float()
-            factor = src_size // s
-            grid = F.avg_pool3d(full.unsqueeze(0), kernel_size=factor).squeeze(0)
-        else:
-            grid[:, coords[:, 0].long(), coords[:, 1].long(), coords[:, 2].long()] = values.T.float()
-
-        return grid
+        return data['coords'], data['values'], int(data['shape'][1])
 
     def get_validation_dataset(self):
         val_set = copy.copy(self)
@@ -283,42 +267,44 @@ class RobomimicReplayVoxelSymDataset(BaseImageDataset):
             obs_dict[key] = data[key][T_slice].astype(np.float32)
             del data[key]
 
-        # Load voxels from sparse .pt cache files
+        # Load sparse voxel data (no dense reconstruction on CPU)
         buffer_start_idx, buffer_end_idx, sample_start_idx, sample_end_idx \
             = self.sampler.indices[idx]
         n_data = buffer_end_idx - buffer_start_idx
-        seq_len = self.sampler.sequence_length
-        s = self.voxel_target_size
-        voxel_shape = (3, s, s, s)
 
-        # Apply key_first_k logic: only load first n_obs_steps frames
+        # With n_obs_steps=1, we only need one frame's sparse data
+        # Handle padding: if at episode boundary, use the first/last valid frame
         if self.n_obs_steps is not None:
             k_data = min(self.n_obs_steps, n_data)
-            voxel_list = []
-            for i in range(k_data):
-                demo_id, frame_id = self._global_to_demo_frame(buffer_start_idx + i)
-                voxel_list.append(self._load_voxel(demo_id, frame_id))
-            # Pad remaining slots with zeros (unused but needed for padding logic)
-            for i in range(k_data, n_data):
-                voxel_list.append(torch.zeros(voxel_shape))
-            voxels = torch.stack(voxel_list)
         else:
-            voxels = torch.stack([
-                self._load_voxel(*self._global_to_demo_frame(buffer_start_idx + i))
-                for i in range(n_data)
-            ])
+            k_data = n_data
 
-        # Apply same padding logic as SequenceSampler.sample_sequence
-        if (sample_start_idx > 0) or (sample_end_idx < seq_len):
-            padded = torch.zeros((seq_len,) + voxel_shape)
-            if sample_start_idx > 0:
-                padded[:sample_start_idx] = voxels[0]
-            if sample_end_idx < seq_len:
-                padded[sample_end_idx:] = voxels[-1]
-            padded[sample_start_idx:sample_end_idx] = voxels
-            voxels = padded
+        # For the voxel obs, we only use T_slice (first n_obs_steps frames)
+        # Just load the first frame (n_obs_steps is typically 1 for voxels)
+        frame_idx_in_buffer = 0
+        if sample_start_idx > 0:
+            # Padding at start: use first data frame
+            frame_idx_in_buffer = 0
+        demo_id, frame_id = self._global_to_demo_frame(buffer_start_idx + frame_idx_in_buffer)
+        coords, values, src_size = self._load_voxel_sparse(demo_id, frame_id)
 
-        obs_dict['voxels'] = voxels[T_slice]
+        # Pad coords/values to fixed length so default collate can stack them
+        max_pts = self.max_sparse_pts
+        N = coords.shape[0]
+        if N > max_pts:
+            coords = coords[:max_pts]
+            values = values[:max_pts]
+            N = max_pts
+        coords_padded = torch.zeros(max_pts, 3, dtype=coords.dtype)
+        values_padded = torch.zeros(max_pts, 3, dtype=values.dtype)
+        coords_padded[:N] = coords
+        values_padded[:N] = values
+
+        # Add temporal dim to match [T, ...] convention (T=n_obs_steps, typically 1)
+        obs_dict['voxel_coords'] = coords_padded.unsqueeze(0)      # [1, max_pts, 3]
+        obs_dict['voxel_values'] = values_padded.unsqueeze(0)       # [1, max_pts, 3]
+        obs_dict['voxel_n_pts'] = torch.tensor([[N]], dtype=torch.long)  # [1, 1]
+        obs_dict['voxel_src_size'] = torch.tensor([[src_size]], dtype=torch.long)  # [1, 1]
 
         torch_data = {
             'obs': dict_apply(obs_dict,

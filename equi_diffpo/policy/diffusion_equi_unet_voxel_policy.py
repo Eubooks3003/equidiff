@@ -202,6 +202,7 @@ class DiffusionEquiUNetPolicyVoxel(BaseImagePolicy):
         assert 'past_action' not in obs_dict # not implemented yet
         # normalize input
         nobs = self.normalizer.normalize(obs_dict)
+        nobs = self._sparse_to_dense_voxels(nobs)
         value = next(iter(nobs.values()))
         B, To = value.shape[:2]
         T = self.horizon
@@ -252,10 +253,40 @@ class DiffusionEquiUNetPolicyVoxel(BaseImagePolicy):
     def set_normalizer(self, normalizer: LinearNormalizer):
         self.normalizer.load_state_dict(normalizer.state_dict())
 
+    @staticmethod
+    def _sparse_to_dense_voxels(nobs):
+        """Reconstruct dense voxel grid on GPU from sparse coords/values."""
+        if 'voxels' in nobs:
+            return nobs
+        coords = nobs.pop('voxel_coords')    # [B, T, max_pts, 3]
+        values = nobs.pop('voxel_values')    # [B, T, max_pts, 3]
+        n_pts = nobs.pop('voxel_n_pts')      # [B, T, 1]
+        src_size = nobs.pop('voxel_src_size') # [B, T, 1]
+        B, T = coords.shape[0], coords.shape[1]
+        s = int(src_size[0, 0, 0].item())
+        device = coords.device
+
+        grid = torch.zeros(B * T, 3, s, s, s, device=device)
+        coords_flat = coords.reshape(B * T, -1, 3)
+        values_flat = values.reshape(B * T, -1, 3)
+        n_pts_flat = n_pts.reshape(B * T)
+
+        for i in range(B * T):
+            n = int(n_pts_flat[i].item())
+            if n > 0:
+                c = coords_flat[i, :n].long()
+                v = values_flat[i, :n].float()
+                grid[i, :, c[:, 0], c[:, 1], c[:, 2]] = v.T
+
+        nobs['voxels'] = grid.reshape(B, T, 3, s, s, s)
+        return nobs
+
     def compute_loss(self, batch):
         # normalize input
         assert 'valid_mask' not in batch
         nobs = self.normalizer.normalize(batch['obs'])
+        # Reconstruct dense voxels on GPU from sparse data
+        nobs = self._sparse_to_dense_voxels(nobs)
         nactions = self.normalizer['action'].normalize(batch['action'])
         if self.rot_aug:
             nobs, nactions = self.rot_randomizer(nobs, nactions)
