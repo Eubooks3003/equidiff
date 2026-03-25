@@ -10,12 +10,13 @@ Usage:
         --n_test 50 --seeds 42 123 456 \
         --device cuda:0
 
-Example:
+Example with wandb diagnostics:
     python eval.py \
         --checkpoint data/outputs/.../checkpoints/latest.ckpt \
         --dataset_path ~/data/3D-DLP-mimicgen-data/core/mug_cleanup_d0.hdf5 \
         --n_test 50 --seeds 42 123 456 \
-        --save_videos
+        --save_videos --video_res 512 \
+        --wandb --wandb_project equidiff-eval
 """
 
 import sys
@@ -104,10 +105,28 @@ def backproject_depth(depth_z, K, pixel_stride=1):
     return pts_cam, idxs
 
 
+def depth_to_z(depth_raw, near_m, far_m):
+    """Convert depth buffer to metric depth.
+    Handles both raw OpenGL buffer ([0,1]) and already-metric depth.
+    Exact match to EC-Diffuser's depth_to_z with mode='robosuite'.
+    """
+    d = depth_raw.squeeze().astype(np.float32)
+    dmax = float(np.nanmax(d)) if np.isfinite(d).any() else 0.0
+
+    if dmax > 1.05:
+        # Already metric — robomimic may have pre-converted
+        return d
+
+    d = np.clip(d, 0.0, 1.0)
+    n, f = float(near_m), float(far_m)
+    return (n * f) / (f - d * (f - n) + 1e-12)
+
+
 def obs_to_voxels(sim, obs, cams, voxel_bounds, grid_whd=(128, 128, 128),
                   voxel_mode="avg_rgb", pixel_stride=1):
     """
     Convert robosuite observation to voxel grid via depth backprojection.
+    Pipeline matches EC-Diffuser's MimicGenDLPWrapper exactly.
 
     Args:
         sim: robosuite MjSim object (for camera matrices)
@@ -123,62 +142,68 @@ def obs_to_voxels(sim, obs, cams, voxel_bounds, grid_whd=(128, 128, 128),
     """
     from datasets.voxelize_ds_wrapper import VoxelGridXYZ
 
+    # Near/far in meters (multiply by extent — the big gotcha)
+    extent = float(sim.model.stat.extent)
+    near_m = float(sim.model.vis.map.znear) * extent
+    far_m = float(sim.model.vis.map.zfar) * extent
+
     all_xyz, all_rgb = [], []
 
     for cam in cams:
         depth_key = f"{cam}_depth"
         img_key = f"{cam}_image"
         if depth_key not in obs or img_key not in obs:
+            print(f"  WARNING: {depth_key} or {img_key} not in obs. "
+                  f"Available keys: {[k for k in obs if 'image' in k or 'depth' in k]}")
             continue
 
-        depth_raw = obs[depth_key].squeeze()
+        depth_raw = obs[depth_key]
         img = obs[img_key]
         if img.ndim == 3 and img.shape[0] in (1, 3):
             img = np.transpose(img, (1, 2, 0))
 
-        H, W = depth_raw.shape[:2]
+        # --- Depth to metric (handles both raw buffer and pre-converted) ---
+        z = depth_to_z(depth_raw, near_m, far_m)
+        H, W = z.shape
 
-        # Get camera intrinsics from sim
-        fovy = sim.model.cam_fovy[sim.model.camera_name2id(cam)]
+        # --- Intrinsics from FOV ---
+        cam_id = sim.model.camera_name2id(cam)
+        fovy = float(sim.model.cam_fovy[cam_id])
         K = compute_K_from_fovy(fovy, W, H)
 
-        # Get camera extrinsics from sim
-        cam_id = sim.model.camera_name2id(cam)
-        cam_pos = sim.data.cam_xpos[cam_id]
-        cam_mat = sim.data.cam_xmat[cam_id].reshape(3, 3)
-        # MuJoCo convention: camera looks along -z, y is down
-        # Convert to standard: R_world_cam
-        R_mj = cam_mat  # columns are camera axes in world frame
-        # MuJoCo: x=right, y=down, z=backward -> OpenCV: x=right, y=down, z=forward
-        R_cv = R_mj.copy()
-        R_cv[:, 2] = -R_cv[:, 2]  # flip z axis
-
-        # Build cam2world transform
-        T_c2w = np.eye(4, dtype=np.float32)
-        T_c2w[:3, :3] = R_cv
-        T_c2w[:3, 3] = cam_pos
-
-        # Convert depth: MuJoCo depth buffer is in [0, 1], convert to meters
-        extent = sim.model.stat.extent
-        near = sim.model.vis.map.znear * extent
-        far = sim.model.vis.map.zfar * extent
-        depth_m = near / (1.0 - depth_raw * (1.0 - near / far))
-
-        # Backproject
-        pts_cam, idxs = backproject_depth(depth_m, K, pixel_stride)
-        if pts_cam.shape[0] == 0:
+        # --- Backproject to camera-frame points (OpenCV: x-right, y-down, z-forward) ---
+        vv = np.arange(0, H, pixel_stride, dtype=np.int32)
+        uu = np.arange(0, W, pixel_stride, dtype=np.int32)
+        U, V = np.meshgrid(uu, vv)
+        Z = z[V, U]
+        valid = np.isfinite(Z) & (Z > 0)
+        if not np.any(valid):
             continue
 
-        # Get colors
-        v, u = idxs[:, 0], idxs[:, 1]
-        rgb = img[v, u].astype(np.float32)
+        Uv = U[valid].astype(np.float32)
+        Vv = V[valid].astype(np.float32)
+        Zv = Z[valid].astype(np.float32)
+        fx, fy = float(K[0, 0]), float(K[1, 1])
+        cx, cy = float(K[0, 2]), float(K[1, 2])
+        X = (Uv - cx) / fx * Zv
+        Y = (Vv - cy) / fy * Zv
+        pts_cam = np.stack([X, Y, Zv], axis=-1).astype(np.float32)
+
+        # --- CV -> MuJoCo(OpenGL) camera coords, then to world ---
+        # Exact match to EC-Diffuser _cam_to_world
+        R = np.array(sim.data.cam_xmat[cam_id], dtype=np.float32).reshape(3, 3)
+        pos = np.array(sim.data.cam_xpos[cam_id], dtype=np.float32)
+
+        pts_gl = pts_cam.copy()
+        pts_gl[:, 1] *= -1.0   # y: down -> up
+        pts_gl[:, 2] *= -1.0   # z: forward -> backward
+        pts_world = (R @ pts_gl.T).T + pos
+
+        # --- Colors ---
+        v_idx, u_idx = V[valid], U[valid]
+        rgb = img[v_idx, u_idx].astype(np.float32)
         if rgb.max() > 1.5:
             rgb /= 255.0
-
-        # Transform to world
-        ones = np.ones((pts_cam.shape[0], 1), np.float32)
-        pts_h = np.concatenate([pts_cam, ones], axis=1)
-        pts_world = (T_c2w @ pts_h.T).T[:, :3]
 
         all_xyz.append(pts_world)
         all_rgb.append(rgb)
@@ -215,6 +240,104 @@ def obs_to_voxels(sim, obs, cams, voxel_bounds, grid_whd=(128, 128, 128),
     vg = VoxelGridXYZ(pts_t, colors_t, grid_whd=(W, H, D),
                       bounds=(pmin, pmax), mode=voxel_mode)
     return vg.to_dense()
+
+
+# ======================== Visualization ========================
+
+def render_highres_frame(sim, cam_name, width=512, height=512):
+    """Render a high-res RGB frame from MuJoCo sim."""
+    frame = sim.render(width=width, height=height, camera_name=cam_name, depth=False)
+    frame = frame[::-1].copy()  # MuJoCo renders bottom-up
+    return frame
+
+
+def voxel_projections(voxels):
+    """Render voxel grid as 3 max-intensity projection images (XY, XZ, YZ).
+
+    Args:
+        voxels: [3, D, H, W] tensor or array (RGB in [0, 1])
+
+    Returns:
+        dict of {"xy": img, "xz": img, "yz": img} as uint8 HWC arrays
+    """
+    if isinstance(voxels, torch.Tensor):
+        voxels = voxels.cpu().numpy()
+
+    v = np.clip(voxels, 0, 1)  # [3, D, H, W]
+    # Max-intensity projections along each axis
+    xy = v.max(axis=1)                   # [3, H, W] — project along D (depth/z)
+    xz = v.max(axis=2)                   # [3, D, W] — project along H (y)
+    yz = v.max(axis=3)                   # [3, D, H] — project along W (x)
+
+    def to_img(proj):
+        img = np.transpose(proj, (1, 2, 0))  # [H, W, 3]
+        return (img * 255).astype(np.uint8)
+
+    return {"xy": to_img(xy), "xz": to_img(xz), "yz": to_img(yz)}
+
+
+def log_voxels_3d(name, voxels, step, output_dir='eval_output',
+                  use_wandb=True, topk=60000):
+    """Log voxel grid as interactive 3D plotly scatter.
+
+    Saves HTML locally under output_dir/voxels/ AND logs to wandb.
+
+    Args:
+        name: log key
+        voxels: [3, D, H, W] tensor or array (RGB values in [0, 1])
+        step: sim timestep (for filename/caption)
+        output_dir: local save directory
+        use_wandb: whether to also log to wandb
+        topk: max points to render
+    """
+    import plotly.graph_objects as go
+
+    if isinstance(voxels, torch.Tensor):
+        voxels = voxels.cpu().numpy()
+
+    C, D, H, W = voxels.shape
+    mag = np.sqrt(np.sum(voxels ** 2, axis=0))  # [D, H, W]
+    mask = mag > 0.1
+    n_occupied = int(mask.sum())
+
+    if n_occupied == 0:
+        print(f"  [voxel_log] t={step}: EMPTY voxel grid, skipping")
+        return
+
+    zz, yy, xx = np.where(mask)
+    colors = voxels[:, zz, yy, xx].T  # [N, 3]
+    scores = mag[zz, yy, xx]
+
+    if len(zz) > topk:
+        idx = np.argsort(scores)[-topk:]
+        zz, yy, xx = zz[idx], yy[idx], xx[idx]
+        colors = colors[idx]
+
+    colors = np.clip(colors, 0, 1) * 255
+    color_strs = [f'rgb({int(r)},{int(g)},{int(b)})' for r, g, b in colors]
+
+    fig = go.Figure(data=[go.Scatter3d(
+        x=xx.tolist(), y=yy.tolist(), z=zz.tolist(),
+        mode='markers',
+        marker=dict(size=2, color=color_strs, opacity=0.8),
+    )])
+    fig.update_layout(
+        scene=dict(aspectmode='data'),
+        margin=dict(l=0, r=0, b=0, t=30),
+        title=f"{name} t={step} ({len(zz)} pts)",
+    )
+
+    # Always save locally as HTML
+    voxel_dir = os.path.join(output_dir, 'voxels')
+    os.makedirs(voxel_dir, exist_ok=True)
+    html_path = os.path.join(voxel_dir, f'{name}_t{step:04d}.html')
+    fig.write_html(html_path, include_plotlyjs='cdn')
+    print(f"  [voxel_log] t={step}: {n_occupied} occupied voxels, saved {html_path}")
+
+    # Log to wandb
+    if use_wandb:
+        import wandb
+        wandb.log({name: wandb.Html(open(html_path).read())})
 
 
 # ======================== Policy Loading ========================
@@ -259,7 +382,8 @@ def get_task_base_name(task_name):
 @torch.no_grad()
 def run_eval(policy, cfg, dataset_path, n_test, seed, max_steps, device,
              grid_whd=(128, 128, 128), cams=("agentview", "sideview"),
-             save_videos=False, output_dir='eval_output', video_episodes=4):
+             save_videos=False, output_dir='eval_output', video_episodes=4,
+             video_res=512, use_wandb=False, log_every_replan=1):
     """Run evaluation rollouts for a single seed with live voxelization."""
 
     import collections
@@ -267,6 +391,12 @@ def run_eval(policy, cfg, dataset_path, n_test, seed, max_steps, device,
     # Setup env
     env_meta = FileUtils.get_env_metadata_from_dataset(dataset_path)
     env_meta['env_kwargs']['use_object_obs'] = False
+    # Enable depth rendering and set camera resolution (required for live voxelization)
+    cam_list = list(cams)
+    env_meta['env_kwargs']['camera_names'] = cam_list
+    env_meta['env_kwargs']['camera_depths'] = [True] * len(cam_list)
+    env_meta['env_kwargs']['camera_heights'] = [256] * len(cam_list)
+    env_meta['env_kwargs']['camera_widths'] = [256] * len(cam_list)
 
     abs_action = OmegaConf.to_container(cfg.task, resolve=True).get('abs_action', True)
     rotation_transformer = None
@@ -300,8 +430,15 @@ def run_eval(policy, cfg, dataset_path, n_test, seed, max_steps, device,
     ])
     ObsUtils.initialize_obs_modality_mapping_from_dict(modality_mapping)
 
-    env = EnvUtils.create_env_from_metadata(
-        env_meta=env_meta, render=False, render_offscreen=True, use_image_obs=True)
+    try:
+        env = EnvUtils.create_env_from_metadata(
+            env_meta=env_meta, render=False, render_offscreen=True,
+            use_image_obs=True, use_depth_obs=True)
+    except TypeError:
+        # older robomimic API
+        env = EnvUtils.create_env_from_metadata(
+            env_meta=env_meta, render=False, render_offscreen=True,
+            use_image_obs=True)
 
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -316,6 +453,10 @@ def run_eval(policy, cfg, dataset_path, n_test, seed, max_steps, device,
 
         # Video recording
         frames = [] if save_videos and ep < video_episodes else None
+
+        # Action tracking for wandb
+        action_log = []
+        replan_count = 0
 
         done = False
         t = 0
@@ -336,16 +477,17 @@ def run_eval(policy, cfg, dataset_path, n_test, seed, max_steps, device,
                 voxel_mode="avg_rgb",
             )  # [3, D, H, W]
 
-            # Capture frame for video
-            if frames is not None and f'{cams[0]}_image' in raw_obs:
-                img = raw_obs[f'{cams[0]}_image']
-                if img.ndim == 3 and img.shape[0] in (1, 3):
-                    img = np.transpose(img, (1, 2, 0))
-                if img.max() <= 1.5:
-                    img = (img * 255).astype(np.uint8)
-                else:
-                    img = img.astype(np.uint8)
-                frames.append(img)
+            # Log voxel 3D scatter (local HTML + wandb)
+            if ep < video_episodes and replan_count % log_every_replan == 0:
+                log_voxels_3d("voxel_obs", voxels, step=t,
+                              output_dir=output_dir, use_wandb=use_wandb)
+
+            # Capture high-res frame for video (at replan step)
+            if frames is not None:
+                frame = render_highres_frame(
+                    env.env.sim, cam_name=cams[0],
+                    width=video_res, height=video_res)
+                frames.append(frame)
 
             # Build observation dict matching policy's expected format
             # Shape: [B, T, ...] where B=1, T=n_obs_steps
@@ -370,11 +512,21 @@ def run_eval(policy, cfg, dataset_path, n_test, seed, max_steps, device,
                 print(f"WARNING: non-finite action at ep={ep} t={t}")
                 break
 
+            replan_count += 1
+
             # Execute action steps
             for a_idx in range(action.shape[1]):
                 if t >= max_steps:
                     break
                 a = action[0, a_idx]
+
+                # Track actions
+                action_log.append({
+                    "t": t, "replan": replan_count - 1, "a_idx": a_idx,
+                    "x": float(a[0]), "y": float(a[1]), "z": float(a[2]),
+                    "gripper": float(a[9]) if len(a) > 9 else float(a[-1]),
+                })
+
 
                 # Convert from rotation_6d back to axis_angle for env
                 env_action = a
@@ -389,13 +541,20 @@ def run_eval(policy, cfg, dataset_path, n_test, seed, max_steps, device,
                 max_reward = max(max_reward, reward)
                 t += 1
 
+                # Capture frame at EVERY sim step for smooth video
+                if frames is not None:
+                    frame = render_highres_frame(
+                        env.env.sim, cam_name=cams[0],
+                        width=video_res, height=video_res)
+                    frames.append(frame)
+
                 if done:
                     break
 
         successes.append(float(max_reward))
         pbar.set_postfix(sr=f"{np.mean(successes)*100:.0f}%", succ=sum(1 for s in successes if s > 0.5))
 
-        # Save video
+        # Save video (local + wandb)
         if frames is not None and len(frames) > 0:
             try:
                 import imageio
@@ -404,8 +563,38 @@ def run_eval(policy, cfg, dataset_path, n_test, seed, max_steps, device,
                 os.makedirs(video_dir, exist_ok=True)
                 video_path = os.path.join(video_dir, f'ep{ep:02d}_{status}.mp4')
                 imageio.mimsave(video_path, frames, fps=20)
+
+                if use_wandb:
+                    import wandb
+                    wandb.log({
+                        f"video/seed{seed}_ep{ep:02d}_{status}": wandb.Video(
+                            video_path, fps=20, format="mp4"),
+                    })
             except Exception as e:
                 print(f"Failed to save video: {e}")
+
+        # Log action trajectory plot to wandb
+        if use_wandb and ep < video_episodes and len(action_log) > 0:
+            import wandb
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            ts = [a["t"] for a in action_log]
+            fig, axes = plt.subplots(4, 1, figsize=(14, 10), sharex=True)
+            for ax, key, label in zip(axes,
+                    ["x", "y", "z", "gripper"],
+                    ["pos_x", "pos_y", "pos_z", "gripper"]):
+                vals = [a[key] for a in action_log]
+                ax.plot(ts, vals, linewidth=1)
+                ax.set_ylabel(label)
+                ax.grid(True, alpha=0.3)
+            axes[-1].set_xlabel("timestep")
+            status = "success" if max_reward > 0.5 else "fail"
+            axes[0].set_title(f"seed{seed} ep{ep} ({status}, replans={replan_count})")
+            plt.tight_layout()
+            wandb.log({f"actions/trajectory_seed{seed}_ep{ep:02d}": wandb.Image(fig)})
+            plt.close(fig)
 
     env.close()
 
@@ -426,8 +615,22 @@ def main():
     parser.add_argument('--cams', type=str, nargs='+', default=['agentview', 'sideview'])
     parser.add_argument('--save_videos', action='store_true')
     parser.add_argument('--video_episodes', type=int, default=4)
+    parser.add_argument('--video_res', type=int, default=512,
+                        help='Resolution for video rendering (default: 512)')
     parser.add_argument('--output_dir', type=str, default='eval_output')
+    # wandb
+    parser.add_argument('--wandb', action='store_true', help='Enable wandb logging')
+    parser.add_argument('--wandb_project', type=str, default='equidiff-eval')
+    parser.add_argument('--log_every_replan', type=int, default=1,
+                        help='Log voxel obs to wandb every N replans (1=every replan)')
     args = parser.parse_args()
+
+    # Init wandb
+    if args.wandb:
+        import wandb
+        ckpt_name = os.path.basename(os.path.dirname(os.path.dirname(args.checkpoint)))
+        run_name = f"eval_{ckpt_name}_n{args.n_test}"
+        wandb.init(project=args.wandb_project, name=run_name, config=vars(args))
 
     print(f"Loading checkpoint: {args.checkpoint}")
     policy, cfg = load_policy_from_checkpoint(args.checkpoint, args.device)
@@ -467,6 +670,9 @@ def main():
             save_videos=args.save_videos,
             output_dir=args.output_dir,
             video_episodes=args.video_episodes,
+            video_res=args.video_res,
+            use_wandb=args.wandb,
+            log_every_replan=args.log_every_replan,
         )
         all_results[seed] = {'success_rate': success_rate, 'rewards': rewards}
 
@@ -480,6 +686,18 @@ def main():
     for seed in args.seeds:
         print(f"  Seed {seed}: {all_results[seed]['success_rate']:.3f}")
     print(f"  Mean: {mean_rate:.3f} +/- {std_rate:.3f}")
+
+    # Log summary to wandb
+    if args.wandb:
+        import wandb
+        log_data = {
+            "summary/mean_success_rate": float(mean_rate),
+            "summary/std_success_rate": float(std_rate),
+        }
+        for seed in args.seeds:
+            log_data[f"summary/seed_{seed}"] = all_results[seed]['success_rate']
+        wandb.log(log_data)
+        wandb.finish()
 
     results_path = os.path.join(args.output_dir,
         f'eval_{task_name}_n{args.n_test}_seeds{"_".join(map(str, args.seeds))}.json')
