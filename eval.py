@@ -344,7 +344,8 @@ def log_voxels_3d(name, voxels, step, output_dir='eval_output',
     # Always save locally as HTML
     voxel_dir = os.path.join(output_dir, 'voxels')
     os.makedirs(voxel_dir, exist_ok=True)
-    html_path = os.path.join(voxel_dir, f'{name}_t{step:04d}.html')
+    safe_name = name.replace('/', '_')
+    html_path = os.path.join(voxel_dir, f'{safe_name}_t{step:04d}.html')
     fig.write_html(html_path, include_plotlyjs='cdn')
     print(f"  [voxel_log] t={step}: {n_occupied} occupied ({D}x{H}x{W} grid), saved {html_path}")
 
@@ -412,11 +413,14 @@ def run_eval(policy, cfg, dataset_path, n_test, seed, max_steps, device,
     env_meta['env_kwargs']['camera_heights'] = [256] * len(cam_list)
     env_meta['env_kwargs']['camera_widths'] = [256] * len(cam_list)
 
-    abs_action = OmegaConf.to_container(cfg.task, resolve=True).get('abs_action', True)
-    rotation_transformer = None
-    if abs_action:
-        env_meta['env_kwargs']['controller_configs']['control_delta'] = False
-        rotation_transformer = RotationTransformer('axis_angle', 'rotation_6d')
+    # The model outputs delta actions with 6D rotation representation.
+    # The dataset's abs_action=True only converts rotation (axis_angle -> 6D),
+    # it does NOT convert delta -> absolute positions. The raw HDF5 actions are
+    # delta actions in [-1, 1]. So we need:
+    #   - rotation_transformer to convert 6D back to axis_angle for the env
+    #   - control_delta=True (DEFAULT) so the controller treats actions as deltas
+    # Do NOT set control_delta=False — that would send deltas as absolute positions.
+    rotation_transformer = RotationTransformer('axis_angle', 'rotation_6d')
 
     n_obs_steps = cfg.n_obs_steps
     n_action_steps = cfg.n_action_steps
@@ -545,13 +549,11 @@ def run_eval(policy, cfg, dataset_path, n_test, seed, max_steps, device,
 
 
                 # Convert from rotation_6d back to axis_angle for env
-                env_action = a
-                if abs_action and rotation_transformer is not None:
-                    pos = a[:3]
-                    rot6d = a[3:9]
-                    gripper = a[9:]
-                    rot_aa = rotation_transformer.inverse(rot6d)
-                    env_action = np.concatenate([pos, rot_aa, gripper])
+                pos = a[:3]
+                rot6d = a[3:9]
+                gripper = a[9:]
+                rot_aa = rotation_transformer.inverse(rot6d)
+                env_action = np.concatenate([pos, rot_aa, gripper])
 
                 raw_obs, reward, done, info = env.step(env_action)
                 max_reward = max(max_reward, reward)
@@ -639,6 +641,8 @@ def main():
     parser.add_argument('--wandb_project', type=str, default='equidiff-eval')
     parser.add_argument('--log_every_replan', type=int, default=1,
                         help='Log voxel obs to wandb every N replans (1=every replan)')
+    parser.add_argument('--voxel_cache_dir', type=str, default=None,
+                        help='Override voxel cache dir for diagnostics')
     args = parser.parse_args()
 
     # Init wandb
@@ -676,8 +680,16 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     # Log a few training cache voxels to wandb for comparison
-    voxel_cache_dir = OmegaConf.to_container(cfg, resolve=True).get('voxel_cache_dir', '')
+    voxel_cache_dir = args.voxel_cache_dir or OmegaConf.to_container(cfg, resolve=True).get('voxel_cache_dir', '')
     voxel_cache_dir = os.path.expanduser(voxel_cache_dir)
+    # Fall back to local cache if remote path doesn't exist
+    if not os.path.isdir(voxel_cache_dir):
+        local_fallback = os.path.join(
+            os.path.dirname(dataset_path).replace('/core', ''),
+            task_name, 'voxel_cache')
+        if os.path.isdir(local_fallback):
+            voxel_cache_dir = local_fallback
+            print(f"Using local voxel cache: {voxel_cache_dir}")
     if voxel_cache_dir and os.path.isdir(voxel_cache_dir):
         print(f"\nLogging training cache voxels from: {voxel_cache_dir}")
         for demo_id in [0, 5]:
@@ -704,6 +716,45 @@ def main():
                 tag = f"train_cache/demo{demo_id}_frame{frame_id}"
                 log_voxels_3d(tag, grid, step=0,
                               output_dir=args.output_dir, use_wandb=args.wandb)
+        # === DIAGNOSTIC: feed training voxel to model, check action output ===
+        print("\n--- DIAGNOSTIC: feeding training cache voxel to policy ---")
+        diag_path = os.path.join(voxel_cache_dir, 'voxel', 'demo_0', 'frame0_voxels.pt')
+        if os.path.exists(diag_path):
+            ddata = torch.load(diag_path, map_location='cpu', weights_only=False)
+            dc = ddata['coords'].long()
+            dv = ddata['values'].float()
+            ds = int(ddata['shape'][1])
+            dgrid = torch.zeros(3, ds, ds, ds)
+            dgrid[:, dc[:, 0], dc[:, 1], dc[:, 2]] = dv.T
+            # Need matching low-dim obs — use zeros as placeholder
+            # (the model should still produce spatially coherent actions, not random noise)
+            device = policy.device
+            diag_obs = {
+                'voxels': dgrid.unsqueeze(0).unsqueeze(0).to(device),  # [1, 1, 3, 128, 128, 128]
+                'robot0_eef_pos': torch.zeros(1, 1, 3, device=device),
+                'robot0_eef_quat': torch.tensor([[[1., 0., 0., 0.]]], device=device),  # identity
+                'robot0_gripper_qpos': torch.zeros(1, 1, 2, device=device),
+            }
+            with torch.no_grad():
+                diag_action = policy.predict_action(diag_obs)
+            a = diag_action['action'][0, 0].cpu().numpy()
+            print(f"  Training voxel → action[0]: pos={a[:3]}, rot6d={a[3:9]}, grip={a[9:]}")
+            print(f"  Action range: min={a.min():.4f}, max={a.max():.4f}, std={a.std():.4f}")
+            print(f"  Finite: {np.all(np.isfinite(a))}")
+
+            # Now also test with a ZERO voxel grid (should give different/default action)
+            zero_obs = {
+                'voxels': torch.zeros(1, 1, 3, ds, ds, ds, device=device),
+                'robot0_eef_pos': torch.zeros(1, 1, 3, device=device),
+                'robot0_eef_quat': torch.tensor([[[1., 0., 0., 0.]]], device=device),
+                'robot0_gripper_qpos': torch.zeros(1, 1, 2, device=device),
+            }
+            with torch.no_grad():
+                zero_action = policy.predict_action(zero_obs)
+            a0 = zero_action['action'][0, 0].cpu().numpy()
+            print(f"  Zero voxel → action[0]: pos={a0[:3]}, rot6d={a0[3:9]}, grip={a0[9:]}")
+            print(f"  Diff from training voxel: {np.abs(a - a0).mean():.4f}")
+        print("--- END DIAGNOSTIC ---\n")
     else:
         print(f"\nVoxel cache not found at: {voxel_cache_dir} — skipping training voxel logging")
 
