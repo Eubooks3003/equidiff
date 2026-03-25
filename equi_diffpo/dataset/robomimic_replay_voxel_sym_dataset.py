@@ -132,28 +132,23 @@ class RobomimicReplayVoxelSymDataset(BaseImageDataset):
         episode_ends_arr = replay_buffer.episode_ends[:]
         episode_starts_arr = np.concatenate([[0], episode_ends_arr[:-1]])
 
-        # Preload all sparse voxel data into RAM to avoid torch.load() at train time
-        print(f'Preloading sparse voxel data for {n_demo} demos into RAM...')
-        voxel_ram_cache = {}  # (demo_id, frame_id) -> {'coords': tensor, 'values': tensor, 'shape': ...}
-        for demo_id in tqdm(range(n_demo), desc='Preloading voxels'):
+        # Scan sparse voxel files to find max points per frame (needed for padding)
+        print(f'Scanning sparse voxel files for {n_demo} demos...')
+        max_sparse_pts = 0
+        for demo_id in range(n_demo):
             demo_start = episode_starts_arr[demo_id] if demo_id < len(episode_starts_arr) else 0
             demo_end = episode_ends_arr[demo_id] if demo_id < len(episode_ends_arr) else 0
-            n_frames = demo_end - demo_start
-            for frame_id in range(n_frames):
-                path = os.path.join(
-                    voxel_cache_dir, 'voxel',
-                    f'demo_{demo_id}', f'frame{frame_id}_voxels.pt')
-                if os.path.exists(path):
-                    data = torch.load(path, weights_only=False, map_location='cpu')
-                    voxel_ram_cache[(demo_id, frame_id)] = {
-                        'coords': data['coords'],
-                        'values': data['values'],
-                        'shape': data['shape'],
-                    }
-        max_sparse_pts = max(d['coords'].shape[0] for d in voxel_ram_cache.values())
-        print(f'Preloaded {len(voxel_ram_cache)} voxel frames into RAM (max {max_sparse_pts} pts/frame).')
+            # Just check the first frame of each demo (pts count is roughly consistent)
+            path = os.path.join(
+                voxel_cache_dir, 'voxel',
+                f'demo_{demo_id}', f'frame0_voxels.pt')
+            if os.path.exists(path):
+                data = torch.load(path, weights_only=False, map_location='cpu')
+                max_sparse_pts = max(max_sparse_pts, data['coords'].shape[0])
+        # Add 10% headroom for frames with more points
+        max_sparse_pts = int(max_sparse_pts * 1.1)
+        print(f'Max sparse points per frame: {max_sparse_pts}')
 
-        self.voxel_ram_cache = voxel_ram_cache
         self.max_sparse_pts = max_sparse_pts
         self.replay_buffer = replay_buffer
         self.sampler = sampler
@@ -179,16 +174,14 @@ class RobomimicReplayVoxelSymDataset(BaseImageDataset):
         return episode_idx, frame_idx
 
     def _load_voxel_sparse(self, demo_id, frame_id):
-        """Load sparse voxel data from RAM cache.
+        """Load sparse voxel data from disk.
 
         Returns (coords [N, 3] int16, values [N, 3] float16, src_size int).
         """
-        data = self.voxel_ram_cache.get((demo_id, frame_id))
-        if data is None:
-            path = os.path.join(
-                self.voxel_cache_dir, 'voxel',
-                f'demo_{demo_id}', f'frame{frame_id}_voxels.pt')
-            data = torch.load(path, weights_only=False, map_location='cpu')
+        path = os.path.join(
+            self.voxel_cache_dir, 'voxel',
+            f'demo_{demo_id}', f'frame{frame_id}_voxels.pt')
+        data = torch.load(path, weights_only=False, map_location='cpu')
         return data['coords'], data['values'], int(data['shape'][1])
 
     def get_validation_dataset(self):
