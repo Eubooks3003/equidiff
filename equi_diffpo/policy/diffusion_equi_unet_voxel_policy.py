@@ -81,12 +81,14 @@ class DiffusionEquiUNetPolicyVoxel(BaseImagePolicy):
         elif color:
             obs_channel = 3
         elif depth:
-            obs_channel = 1  
+            obs_channel = 1
+
+        voxel_size = shape_meta['obs']['voxels']['shape'][1]
 
         self.enc = EquivariantObsEncVoxel(
-            obs_shape=(obs_channel, 64, 64, 64), 
-            crop_shape=crop_shape, 
-            n_hidden=enc_n_hidden, 
+            obs_shape=(obs_channel, voxel_size, voxel_size, voxel_size),
+            crop_shape=crop_shape,
+            n_hidden=enc_n_hidden,
             N=N,
             initialize=initialize,
 )
