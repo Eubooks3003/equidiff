@@ -183,13 +183,6 @@ def obs_to_voxels(sim, obs, cams, voxel_bounds, grid_whd=(128, 128, 128),
         z = depth_to_z(depth_raw, near_m, far_m)
         H, W = z.shape
 
-        # Diagnostic: print depth stats for first camera on first call
-        if not hasattr(obs_to_voxels, '_depth_logged'):
-            d_raw = depth_raw.squeeze()
-            print(f"  [depth_diag] {cam}: raw range=[{d_raw.min():.4f}, {d_raw.max():.4f}], "
-                  f"median={np.median(d_raw):.4f}, metric range=[{z.min():.4f}, {z.max():.4f}]")
-            if cam == cams[-1]:
-                obs_to_voxels._depth_logged = True
 
         # --- Intrinsics from FOV ---
         cam_id = sim.model.camera_name2id(cam)
@@ -366,18 +359,9 @@ def log_voxels_3d(name, voxels, step, output_dir='eval_output',
         title=f"{name} t={step} ({len(zz)} pts)",
     )
 
-    # Always save locally as HTML
-    voxel_dir = os.path.join(output_dir, 'voxels')
-    os.makedirs(voxel_dir, exist_ok=True)
-    safe_name = name.replace('/', '_')
-    html_path = os.path.join(voxel_dir, f'{safe_name}_t{step:04d}.html')
-    fig.write_html(html_path, include_plotlyjs='cdn')
-    print(f"  [voxel_log] t={step}: {n_occupied} occupied ({D}x{H}x{W} grid), saved {html_path}")
-
-    # Log to wandb
     if use_wandb:
         import wandb
-        wandb.log({name: wandb.Html(open(html_path).read())})
+        wandb.log({name: fig})
 
 
 # ======================== Policy Loading ========================
@@ -602,7 +586,7 @@ def run_eval(policy, cfg, dataset_path, n_test, seed, max_steps, device,
             try:
                 import imageio
                 status = "success" if max_reward > 0.5 else "fail"
-                video_dir = os.path.join(output_dir, 'videos', f'seed{seed}')
+                video_dir = os.path.join(output_dir, task_name, 'videos', f'seed{seed}')
                 os.makedirs(video_dir, exist_ok=True)
                 video_path = os.path.join(video_dir, f'ep{ep:02d}_{status}.mp4')
                 imageio.mimsave(video_path, frames, fps=20)
@@ -829,8 +813,10 @@ def main():
         wandb.log(log_data)
         wandb.finish()
 
-    results_path = os.path.join(args.output_dir,
-        f'eval_{task_name}_n{args.n_test}_seeds{"_".join(map(str, args.seeds))}.json')
+    task_output_dir = os.path.join(args.output_dir, task_name)
+    os.makedirs(task_output_dir, exist_ok=True)
+    results_path = os.path.join(task_output_dir,
+        f'eval_n{args.n_test}_seeds{"_".join(map(str, args.seeds))}.json')
     with open(results_path, 'w') as f:
         json.dump({
             'checkpoint': args.checkpoint,
