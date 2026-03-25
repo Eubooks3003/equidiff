@@ -105,21 +105,38 @@ def backproject_depth(depth_z, K, pixel_stride=1):
     return pts_cam, idxs
 
 
-def depth_to_z(depth_raw, near_m, far_m):
+def depth_to_z(depth_raw, near_m, far_m, mode="auto"):
     """Convert depth buffer to metric depth.
-    Handles both raw OpenGL buffer ([0,1]) and already-metric depth.
-    Exact match to EC-Diffuser's depth_to_z with mode='robosuite'.
+
+    Modes:
+      - 'robosuite': OpenGL depth buffer inversion (for raw sim depth)
+      - 'linear': linear interpolation (for pre-linearized depth)
+      - 'auto': detect based on value range
     """
     d = depth_raw.squeeze().astype(np.float32)
     dmax = float(np.nanmax(d)) if np.isfinite(d).any() else 0.0
+    dmin = float(np.nanmin(d)) if np.isfinite(d).any() else 0.0
 
     if dmax > 1.05:
-        # Already metric — robomimic may have pre-converted
+        # Already metric
         return d
 
     d = np.clip(d, 0.0, 1.0)
     n, f = float(near_m), float(far_m)
-    return (n * f) / (f - d * (f - n) + 1e-12)
+
+    if mode == "auto":
+        # Raw OpenGL buffer: most values clustered near 1.0 (e.g., median > 0.95)
+        # Linearized buffer: values spread across [0, 1]
+        median = float(np.nanmedian(d))
+        if median > 0.95:
+            mode = "robosuite"
+        else:
+            mode = "linear"
+
+    if mode == "linear":
+        return n + d * (f - n)
+    else:  # robosuite
+        return (n * f) / (f - d * (f - n) + 1e-12)
 
 
 def obs_to_voxels(sim, obs, cams, voxel_bounds, grid_whd=(128, 128, 128),
@@ -165,6 +182,14 @@ def obs_to_voxels(sim, obs, cams, voxel_bounds, grid_whd=(128, 128, 128),
         # --- Depth to metric (handles both raw buffer and pre-converted) ---
         z = depth_to_z(depth_raw, near_m, far_m)
         H, W = z.shape
+
+        # Diagnostic: print depth stats for first camera on first call
+        if not hasattr(obs_to_voxels, '_depth_logged'):
+            d_raw = depth_raw.squeeze()
+            print(f"  [depth_diag] {cam}: raw range=[{d_raw.min():.4f}, {d_raw.max():.4f}], "
+                  f"median={np.median(d_raw):.4f}, metric range=[{z.min():.4f}, {z.max():.4f}]")
+            if cam == cams[-1]:
+                obs_to_voxels._depth_logged = True
 
         # --- Intrinsics from FOV ---
         cam_id = sim.model.camera_name2id(cam)
