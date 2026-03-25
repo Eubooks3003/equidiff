@@ -173,8 +173,8 @@ class RobomimicReplayVoxelSymDataset(BaseImageDataset):
         grid = torch.zeros(3, src_size, src_size, src_size)
         grid[:, coords[:, 0], coords[:, 1], coords[:, 2]] = values.T
 
-        # Downsample to target resolution
-        if src_size != self.voxel_target_size:
+        # Downsample to target resolution (skip if already at target)
+        if src_size != self.voxel_target_size and self.voxel_target_size < src_size:
             factor = src_size // self.voxel_target_size
             grid = F.avg_pool3d(grid.unsqueeze(0), kernel_size=factor).squeeze(0)
 

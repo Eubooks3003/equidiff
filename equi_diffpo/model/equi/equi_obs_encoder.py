@@ -6,7 +6,7 @@ from einops import rearrange
 from robomimic.models.base_nets import SpatialSoftmax
 from equi_diffpo.model.common.module_attr_mixin import ModuleAttrMixin
 import equi_diffpo.model.vision.crop_randomizer as dmvc
-from equi_diffpo.model.equi.equi_encoder import EquivariantResEncoder76Cyclic, EquivariantVoxelEncoder58Cyclic, EquivariantVoxelEncoder64Cyclic
+from equi_diffpo.model.equi.equi_encoder import EquivariantResEncoder76Cyclic, EquivariantVoxelEncoder58Cyclic, EquivariantVoxelEncoder64Cyclic, EquivariantVoxelEncoder128Cyclic
 from equi_diffpo.model.vision.voxel_crop_randomizer import VoxelCropRandomizer
 from equi_diffpo.model.common.rotation_transformer import RotationTransformer
 
@@ -132,6 +132,8 @@ class EquivariantObsEncVoxel(ModuleAttrMixin):
         self.token_type = nn.FieldType(self.group, self.n_hidden * [self.group.regular_repr])
         if crop_shape[0] == 58:
             self.enc_obs = EquivariantVoxelEncoder58Cyclic(obs_channel, self.n_hidden, initialize)
+        elif obs_shape[1] == 128:
+            self.enc_obs = EquivariantVoxelEncoder128Cyclic(obs_channel, self.n_hidden, initialize)
         else:
             self.enc_obs = EquivariantVoxelEncoder64Cyclic(obs_channel, self.n_hidden, initialize)
         self.enc_out = nn.Linear(

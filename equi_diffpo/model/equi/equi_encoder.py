@@ -234,6 +234,75 @@ class EquivariantVoxelEncoder64Cyclic(torch.nn.Module):
             x = nn.GeometricTensor(x, nn.FieldType(self.group, self.obs_channel * [self.group.trivial_repr]))
         return self.conv(x)
     
+class EquivariantVoxelEncoder128Cyclic(torch.nn.Module):
+    def __init__(self, obs_channel: int = 4, n_out: int = 128, initialize: bool = True, N=8):
+        super().__init__()
+        self.obs_channel = obs_channel
+        self.group = gspaces.rot2dOnR3(N)
+        self.conv = torch.nn.Sequential(
+            # 128
+            nn.R3Conv(
+                nn.FieldType(self.group, obs_channel * [self.group.trivial_repr]),
+                nn.FieldType(self.group, n_out // 32 * [self.group.regular_repr]),
+                kernel_size=3,
+                padding=1,
+                initialize=initialize,
+            ),
+            nn.ReLU(nn.FieldType(self.group, n_out // 32 * [self.group.regular_repr]), inplace=True),
+            nn.PointwiseMaxPool3D(nn.FieldType(self.group, n_out // 32 * [self.group.regular_repr]), 2),
+            # 64
+            nn.R3Conv(nn.FieldType(self.group, n_out // 32 * [self.group.regular_repr]),
+                      nn.FieldType(self.group, n_out // 16 * [self.group.regular_repr]),
+                      kernel_size=3, padding=1, initialize=initialize),
+            nn.ReLU(nn.FieldType(self.group, n_out // 16 * [self.group.regular_repr]), inplace=True),
+            nn.PointwiseMaxPool3D(nn.FieldType(self.group, n_out // 16 * [self.group.regular_repr]), 2),
+            # 32
+            nn.R3Conv(nn.FieldType(self.group, n_out // 16 * [self.group.regular_repr]),
+                      nn.FieldType(self.group, n_out // 8 * [self.group.regular_repr]),
+                      kernel_size=3, padding=1, initialize=initialize),
+            nn.ReLU(nn.FieldType(self.group, n_out // 8 * [self.group.regular_repr]), inplace=True),
+            nn.R3Conv(nn.FieldType(self.group, n_out // 8 * [self.group.regular_repr]),
+                      nn.FieldType(self.group, n_out // 8 * [self.group.regular_repr]),
+                      kernel_size=3, padding=1, initialize=initialize),
+            nn.ReLU(nn.FieldType(self.group, n_out // 8 * [self.group.regular_repr]), inplace=True),
+            nn.PointwiseMaxPool3D(nn.FieldType(self.group, n_out // 8 * [self.group.regular_repr]), 2),
+            # 16
+            nn.R3Conv(nn.FieldType(self.group, n_out // 8 * [self.group.regular_repr]),
+                      nn.FieldType(self.group, n_out // 4 * [self.group.regular_repr]),
+                      kernel_size=3, padding=1, initialize=initialize),
+            nn.ReLU(nn.FieldType(self.group, n_out // 4 * [self.group.regular_repr]), inplace=True),
+            nn.R3Conv(nn.FieldType(self.group, n_out // 4 * [self.group.regular_repr]),
+                      nn.FieldType(self.group, n_out // 4 * [self.group.regular_repr]),
+                      kernel_size=3, padding=1, initialize=initialize),
+            nn.ReLU(nn.FieldType(self.group, n_out // 4 * [self.group.regular_repr]), inplace=True),
+            nn.PointwiseMaxPool3D(nn.FieldType(self.group, n_out // 4 * [self.group.regular_repr]), 2),
+            # 8
+            nn.R3Conv(nn.FieldType(self.group, n_out // 4 * [self.group.regular_repr]),
+                      nn.FieldType(self.group, n_out // 2 * [self.group.regular_repr]),
+                      kernel_size=3, padding=0, initialize=initialize),
+            nn.ReLU(nn.FieldType(self.group, n_out // 2 * [self.group.regular_repr]), inplace=True),
+            nn.R3Conv(nn.FieldType(self.group, n_out // 2 * [self.group.regular_repr]),
+                      nn.FieldType(self.group, n_out // 2 * [self.group.regular_repr]),
+                      kernel_size=3, padding=1, initialize=initialize),
+            nn.ReLU(nn.FieldType(self.group, n_out // 2 * [self.group.regular_repr]), inplace=True),
+            # 6
+            nn.PointwiseMaxPool3D(nn.FieldType(self.group, n_out // 2 * [self.group.regular_repr]), 2),
+            # 3
+            nn.R3Conv(
+                nn.FieldType(self.group, n_out // 2 * [self.group.regular_repr]),
+                nn.FieldType(self.group, n_out * [self.group.regular_repr]),
+                kernel_size=3,
+                padding=0,
+                initialize=initialize,
+            ),
+            nn.ReLU(nn.FieldType(self.group, n_out * [self.group.regular_repr]), inplace=True),
+            # 1x1
+        )
+    def forward(self, x) -> nn.GeometricTensor:
+        if type(x) is torch.Tensor:
+            x = nn.GeometricTensor(x, nn.FieldType(self.group, self.obs_channel * [self.group.trivial_repr]))
+        return self.conv(x)
+
 class EquivariantVoxelEncoder16Cyclic(torch.nn.Module):
     def __init__(self, obs_channel: int = 4, n_out: int = 128, initialize: bool = True, N=8):
         super().__init__()
