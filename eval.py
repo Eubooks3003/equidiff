@@ -216,30 +216,44 @@ def obs_to_voxels(sim, obs, cams, voxel_bounds, grid_whd=(128, 128, 128),
     xyz = np.concatenate(all_xyz, axis=0)
     rgb = np.concatenate(all_rgb, axis=0)
 
-    # Crop to bounds
-    b = voxel_bounds
-    mask = (
-        (xyz[:, 0] >= b["xmin"]) & (xyz[:, 0] <= b["xmax"]) &
-        (xyz[:, 1] >= b["ymin"]) & (xyz[:, 1] <= b["ymax"]) &
-        (xyz[:, 2] >= b["zmin"]) & (xyz[:, 2] <= b["zmax"])
+    # Stage 1: Crop with generous bounds (remove floor/walls/background)
+    # Matches EC-Diffuser's crop_world default
+    CROP = {"xmin": -1.1, "xmax": 0.9, "ymin": -0.5, "ymax": 0.5, "zmin": -0.2, "zmax": 2.5}
+    crop_mask = (
+        (xyz[:, 0] >= CROP["xmin"]) & (xyz[:, 0] <= CROP["xmax"]) &
+        (xyz[:, 1] >= CROP["ymin"]) & (xyz[:, 1] <= CROP["ymax"]) &
+        (xyz[:, 2] >= CROP["zmin"]) & (xyz[:, 2] <= CROP["zmax"])
     )
-    if mask.sum() == 0:
+    if crop_mask.sum() == 0:
         C = 3 if voxel_mode == "avg_rgb" else 1
         W, H, D = grid_whd
         return torch.zeros(C, D, H, W)
-    xyz = xyz[mask]
-    rgb = rgb[mask]
+    xyz = xyz[crop_mask]
+    rgb = rgb[crop_mask]
 
-    # Voxelize
-    pmin = torch.tensor([b["xmin"], b["ymin"], b["zmin"]], dtype=torch.float32)
-    pmax = torch.tensor([b["xmax"], b["ymax"], b["zmax"]], dtype=torch.float32)
+    # Stage 2: Voxelize with per-item bounds (matching training cache bounds_mode=per_item)
     pts_t = torch.from_numpy(xyz).float()
     colors_t = torch.from_numpy(rgb).float() if voxel_mode == "avg_rgb" else None
 
     W, H, D = grid_whd
+
+    # Per-item bounds (tight to this frame's point cloud — matches training)
     vg = VoxelGridXYZ(pts_t, colors_t, grid_whd=(W, H, D),
-                      bounds=(pmin, pmax), mode=voxel_mode)
-    return vg.to_dense()
+                      bounds=None, mode=voxel_mode)
+    vox_per_item = vg.to_dense()
+
+    # Also compute task-bounds version for comparison logging
+    b = voxel_bounds
+    if b is not None:
+        pmin = torch.tensor([b["xmin"], b["ymin"], b["zmin"]], dtype=torch.float32)
+        pmax = torch.tensor([b["xmax"], b["ymax"], b["zmax"]], dtype=torch.float32)
+        vg2 = VoxelGridXYZ(pts_t.clone(), colors_t.clone() if colors_t is not None else None,
+                           grid_whd=(W, H, D), bounds=(pmin, pmax), mode=voxel_mode)
+        vox_task_bounds = vg2.to_dense()
+    else:
+        vox_task_bounds = None
+
+    return vox_per_item, vox_task_bounds
 
 
 # ======================== Visualization ========================
@@ -277,7 +291,7 @@ def voxel_projections(voxels):
 
 
 def log_voxels_3d(name, voxels, step, output_dir='eval_output',
-                  use_wandb=True, topk=60000):
+                  use_wandb=True, topk=150000):
     """Log voxel grid as interactive 3D plotly scatter.
 
     Saves HTML locally under output_dir/voxels/ AND logs to wandb.
@@ -332,7 +346,7 @@ def log_voxels_3d(name, voxels, step, output_dir='eval_output',
     os.makedirs(voxel_dir, exist_ok=True)
     html_path = os.path.join(voxel_dir, f'{name}_t{step:04d}.html')
     fig.write_html(html_path, include_plotlyjs='cdn')
-    print(f"  [voxel_log] t={step}: {n_occupied} occupied voxels, saved {html_path}")
+    print(f"  [voxel_log] t={step}: {n_occupied} occupied ({D}x{H}x{W} grid), saved {html_path}")
 
     # Log to wandb
     if use_wandb:
@@ -414,10 +428,9 @@ def run_eval(policy, cfg, dataset_path, n_test, seed, max_steps, device,
         raise ValueError(f"No voxel bounds defined for task '{task_base}'. "
                          f"Available: {list(TASK_VOXEL_BOUNDS.keys())}")
 
-    # Determine voxel size from shape_meta
-    shape_meta_resolved = OmegaConf.to_container(cfg.shape_meta, resolve=True)
-    voxel_shape = shape_meta_resolved['obs']['voxels']['shape']
-    voxel_size = voxel_shape[1]  # e.g., 128
+    # Training reconstructs voxels at src_size from cache (128^3) via _sparse_to_dense_voxels,
+    # ignoring shape_meta. Use grid_whd passed from caller.
+    voxel_size = grid_whd[0]
 
     # Setup modality mapping for robomimic
     modality_mapping = collections.defaultdict(list)
@@ -467,20 +480,23 @@ def run_eval(policy, cfg, dataset_path, n_test, seed, max_steps, device,
             if t > 0:
                 raw_obs = env.get_observation()
 
-            # Live voxelize
-            voxels = obs_to_voxels(
+            # Live voxelize (returns per-item bounds version + task-bounds version)
+            voxels, voxels_task = obs_to_voxels(
                 sim=env.env.sim,
                 obs=raw_obs,
                 cams=list(cams),
                 voxel_bounds=voxel_bounds,
                 grid_whd=(voxel_size, voxel_size, voxel_size),
                 voxel_mode="avg_rgb",
-            )  # [3, D, H, W]
+            )  # voxels: [3, D, H, W] with per-item bounds (used by policy)
 
-            # Log voxel 3D scatter (local HTML + wandb)
+            # Log both voxel versions for comparison
             if ep < video_episodes and replan_count % log_every_replan == 0:
-                log_voxels_3d("voxel_obs", voxels, step=t,
+                log_voxels_3d("voxel_per_item", voxels, step=t,
                               output_dir=output_dir, use_wandb=use_wandb)
+                if voxels_task is not None:
+                    log_voxels_3d("voxel_task_bounds", voxels_task, step=t,
+                                  output_dir=output_dir, use_wandb=use_wandb)
 
             # Capture high-res frame for video (at replan step)
             if frames is not None:
@@ -648,11 +664,49 @@ def main():
     shape_meta = OmegaConf.to_container(cfg.shape_meta, resolve=True)
     voxel_size = shape_meta['obs']['voxels']['shape'][1]
 
-    print(f"Task: {task_name}, max_steps: {max_steps}, voxel_size: {voxel_size}")
+    # Training reconstructs voxels at src_size from the cache (128^3) via _sparse_to_dense_voxels,
+    # ignoring shape_meta. The encoder handles arbitrary spatial sizes via global pooling.
+    # So eval must also use 128^3 to match training, regardless of what shape_meta says.
+    voxel_size = 128
+    print(f"Task: {task_name}, max_steps: {max_steps}")
+    print(f"Voxel grid: {voxel_size}^3 (forced to match training cache src_size)")
     print(f"Dataset: {dataset_path}")
     print(f"Cameras: {args.cams}")
 
     os.makedirs(args.output_dir, exist_ok=True)
+
+    # Log a few training cache voxels to wandb for comparison
+    voxel_cache_dir = OmegaConf.to_container(cfg, resolve=True).get('voxel_cache_dir', '')
+    voxel_cache_dir = os.path.expanduser(voxel_cache_dir)
+    if voxel_cache_dir and os.path.isdir(voxel_cache_dir):
+        print(f"\nLogging training cache voxels from: {voxel_cache_dir}")
+        for demo_id in [0, 5]:
+            for frame_id in [0, 50]:
+                vox_path = os.path.join(voxel_cache_dir, 'voxel',
+                                        f'demo_{demo_id}', f'frame{frame_id}_voxels.pt')
+                if not os.path.exists(vox_path):
+                    continue
+                data = torch.load(vox_path, map_location='cpu', weights_only=False)
+                coords = data['coords'].long()
+                values = data['values'].float()
+                src_size = int(data['shape'][1])  # 128 from cache
+                # Reconstruct dense grid at cache resolution
+                grid = torch.zeros(3, src_size, src_size, src_size)
+                N = coords.shape[0]
+                grid[0, coords[:N, 0], coords[:N, 1], coords[:N, 2]] = values[:N, 0]
+                grid[1, coords[:N, 0], coords[:N, 1], coords[:N, 2]] = values[:N, 1]
+                grid[2, coords[:N, 0], coords[:N, 1], coords[:N, 2]] = values[:N, 2]
+                # Downsample to eval resolution if different
+                if src_size != voxel_size:
+                    grid = torch.nn.functional.interpolate(
+                        grid.unsqueeze(0), size=(voxel_size, voxel_size, voxel_size),
+                        mode='trilinear', align_corners=False).squeeze(0)
+                tag = f"train_cache/demo{demo_id}_frame{frame_id}"
+                log_voxels_3d(tag, grid, step=0,
+                              output_dir=args.output_dir, use_wandb=args.wandb)
+    else:
+        print(f"\nVoxel cache not found at: {voxel_cache_dir} — skipping training voxel logging")
+
     all_results = {}
 
     for seed in args.seeds:
