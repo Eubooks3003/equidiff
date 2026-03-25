@@ -58,16 +58,16 @@ ema:
 
 dataloader:
   batch_size: 48
-  num_workers: 24
+  num_workers: 8
   shuffle: True
   pin_memory: True
   persistent_workers: True
   drop_last: true
-  prefetch_factor: 4
+  prefetch_factor: 2
 
 val_dataloader:
   batch_size: 48
-  num_workers: 24
+  num_workers: 8
   shuffle: False
   pin_memory: True
   persistent_workers: True
