@@ -23,11 +23,56 @@ from equi_diffpo.model.common.rotation_transformer import RotationTransformer
 max_steps = {
     'stack_d1': 400, 'stack_three_d1': 400, 'square_d2': 400,
     'threading_d2': 400, 'coffee_d2': 400, 'three_piece_assembly_d2': 500,
+    'three_piece_assembly_d0': 500,
     'hammer_cleanup_d1': 500, 'mug_cleanup_d0': 500, 'mug_cleanup_d1': 500,
     'kitchen_d1': 800, 'nut_assembly_d0': 500, 'pick_place_d0': 1000,
     'coffee_preparation_d1': 800, 'tool_hang': 700,
     'can': 400, 'lift': 400, 'square': 400,
+    'square_d0': 400,
 }
+
+def _resolve_task_variant(task_name: str, table: dict):
+    if task_name in table:
+        return task_name
+
+    base = task_name
+    d_suffix = None
+    if '_' in task_name:
+        maybe_base, maybe_diff = task_name.rsplit('_', 1)
+        if maybe_diff.startswith('d') and maybe_diff[1:].isdigit():
+            base = maybe_base
+            d_suffix = maybe_diff
+
+    candidates = []
+    if d_suffix is not None:
+        candidates.extend([
+            f"{base}_{d_suffix}",
+            f"{base}_d2",
+            f"{base}_d1",
+            f"{base}_d0",
+            base,
+        ])
+    else:
+        candidates.append(base)
+
+    for key in candidates:
+        if key in table:
+            return key
+    return None
+
+
+def get_max_steps(task_name: str) -> int:
+    key = _resolve_task_variant(task_name, max_steps)
+    if key is None:
+        # Default for unseen MimicGen d0 tasks.
+        if task_name.rsplit('_', 1)[-1] == 'd0':
+            return 500
+        raise KeyError(
+            f"Unknown task_name '{task_name}' for max_steps resolver. "
+            f"Known keys: {sorted(max_steps.keys())}"
+        )
+    return int(max_steps[key])
+
 
 def get_ws_x_center(task_name):
     if task_name.startswith('kitchen_') or task_name.startswith('hammer_cleanup_'):
@@ -37,7 +82,7 @@ def get_ws_x_center(task_name):
 def get_ws_y_center(task_name):
     return 0.
 
-OmegaConf.register_new_resolver("get_max_steps", lambda x: max_steps[x], replace=True)
+OmegaConf.register_new_resolver("get_max_steps", get_max_steps, replace=True)
 OmegaConf.register_new_resolver("get_ws_x_center", get_ws_x_center, replace=True)
 OmegaConf.register_new_resolver("get_ws_y_center", get_ws_y_center, replace=True)
 OmegaConf.register_new_resolver("eval", eval, replace=True)
