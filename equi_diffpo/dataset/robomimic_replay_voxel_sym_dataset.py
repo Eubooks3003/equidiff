@@ -156,29 +156,39 @@ class RobomimicReplayVoxelSymDataset(BaseImageDataset):
         return episode_idx, frame_idx
 
     def _load_voxel(self, demo_id, frame_id):
-        """Load sparse voxel .pt file and convert to dense downsampled grid.
+        """Load sparse voxel .pt file and convert to dense grid.
 
-        Returns numpy array of shape [C, target_size, target_size, target_size] float32
-        with values in [0, 1].
+        Returns torch.Tensor of shape [C, target_size, target_size, target_size] float32.
         """
         path = os.path.join(
             self.voxel_cache_dir, 'voxel',
             f'demo_{demo_id}', f'frame{frame_id}_voxels.pt')
         data = torch.load(path, weights_only=False, map_location='cpu')
-        coords = data['coords'].long()   # [N, 3]
-        values = data['values'].float()   # [N, 3], already in [0, 1]
-        src_size = data['shape'][1]       # e.g. 128
+        coords = data['coords']   # [N, 3]
+        values = data['values']   # [N, 3], already in [0, 1]
+        src_size = int(data['shape'][1])
 
-        # Reconstruct dense grid [3, src_size, src_size, src_size]
-        grid = torch.zeros(3, src_size, src_size, src_size)
-        grid[:, coords[:, 0], coords[:, 1], coords[:, 2]] = values.T
-
-        # Downsample to target resolution (skip if already at target)
         if src_size != self.voxel_target_size and self.voxel_target_size < src_size:
+            # Downsample: build dense at src resolution, then pool
+            grid = torch.zeros(3, src_size, src_size, src_size)
+            grid[:, coords[:, 0].long(), coords[:, 1].long(), coords[:, 2].long()] = values.T.float()
             factor = src_size // self.voxel_target_size
             grid = F.avg_pool3d(grid.unsqueeze(0), kernel_size=factor).squeeze(0)
+        else:
+            # Build dense directly at target resolution (no pool needed)
+            s = self.voxel_target_size
+            # Use sparse COO tensor for faster construction
+            N = coords.shape[0]
+            idx = torch.stack([
+                torch.arange(3).unsqueeze(1).expand(3, N).reshape(-1),
+                coords[:, 0].long().unsqueeze(0).expand(3, -1).reshape(-1),
+                coords[:, 1].long().unsqueeze(0).expand(3, -1).reshape(-1),
+                coords[:, 2].long().unsqueeze(0).expand(3, -1).reshape(-1),
+            ])  # [4, 3*N]
+            vals = values.T.float().reshape(-1)  # [3*N]
+            grid = torch.sparse_coo_tensor(idx, vals, (3, s, s, s)).to_dense()
 
-        return grid.numpy()
+        return grid
 
     def get_validation_dataset(self):
         val_set = copy.copy(self)
@@ -267,19 +277,23 @@ class RobomimicReplayVoxelSymDataset(BaseImageDataset):
         # Apply key_first_k logic: only load first n_obs_steps frames
         if self.n_obs_steps is not None:
             k_data = min(self.n_obs_steps, n_data)
-            voxels = np.full((n_data,) + voxel_shape, fill_value=np.nan, dtype=np.float32)
+            voxel_list = []
             for i in range(k_data):
                 demo_id, frame_id = self._global_to_demo_frame(buffer_start_idx + i)
-                voxels[i] = self._load_voxel(demo_id, frame_id)
+                voxel_list.append(self._load_voxel(demo_id, frame_id))
+            # Pad remaining slots with zeros (unused but needed for padding logic)
+            for i in range(k_data, n_data):
+                voxel_list.append(torch.zeros(voxel_shape))
+            voxels = torch.stack(voxel_list)
         else:
-            voxels = np.stack([
+            voxels = torch.stack([
                 self._load_voxel(*self._global_to_demo_frame(buffer_start_idx + i))
                 for i in range(n_data)
             ])
 
         # Apply same padding logic as SequenceSampler.sample_sequence
         if (sample_start_idx > 0) or (sample_end_idx < seq_len):
-            padded = np.zeros((seq_len,) + voxel_shape, dtype=np.float32)
+            padded = torch.zeros((seq_len,) + voxel_shape)
             if sample_start_idx > 0:
                 padded[:sample_start_idx] = voxels[0]
             if sample_end_idx < seq_len:
@@ -287,11 +301,11 @@ class RobomimicReplayVoxelSymDataset(BaseImageDataset):
             padded[sample_start_idx:sample_end_idx] = voxels
             voxels = padded
 
-        # Voxel values are already in [0, 1] from the .pt files
         obs_dict['voxels'] = voxels[T_slice]
 
         torch_data = {
-            'obs': dict_apply(obs_dict, torch.from_numpy),
+            'obs': dict_apply(obs_dict,
+                lambda x: torch.from_numpy(x) if isinstance(x, np.ndarray) else x),
             'action': torch.from_numpy(data['action'].astype(np.float32))
         }
         return torch_data
