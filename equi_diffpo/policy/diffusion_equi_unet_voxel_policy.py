@@ -255,7 +255,8 @@ class DiffusionEquiUNetPolicyVoxel(BaseImagePolicy):
 
     @staticmethod
     def _sparse_to_dense_voxels(nobs):
-        """Reconstruct dense voxel grid on GPU from sparse coords/values."""
+        """Reconstruct dense voxel grid on GPU from sparse coords/values.
+        Fully vectorized — no Python loops."""
         if 'voxels' in nobs:
             return nobs
         coords = nobs.pop('voxel_coords')    # [B, T, max_pts, 3]
@@ -264,19 +265,33 @@ class DiffusionEquiUNetPolicyVoxel(BaseImagePolicy):
         src_size = nobs.pop('voxel_src_size') # [B, T, 1]
         B, T = coords.shape[0], coords.shape[1]
         s = int(src_size[0, 0, 0].item())
+        M = coords.shape[2]  # max_pts
         device = coords.device
+        BT = B * T
 
-        grid = torch.zeros(B * T, 3, s, s, s, device=device)
-        coords_flat = coords.reshape(B * T, -1, 3)
-        values_flat = values.reshape(B * T, -1, 3)
-        n_pts_flat = n_pts.reshape(B * T)
+        # Flatten batch and time dims
+        coords_flat = coords.reshape(BT, M, 3).long()
+        values_flat = values.reshape(BT, M, 3).float()
+        n_pts_flat = n_pts.reshape(BT)
 
-        for i in range(B * T):
-            n = int(n_pts_flat[i].item())
-            if n > 0:
-                c = coords_flat[i, :n].long()
-                v = values_flat[i, :n].float()
-                grid[i, :, c[:, 0], c[:, 1], c[:, 2]] = v.T
+        # Build validity mask to exclude zero-padded points (vectorized)
+        pts_range = torch.arange(M, device=device).unsqueeze(0)  # [1, M]
+        mask = pts_range < n_pts_flat.unsqueeze(1)                # [BT, M]
+        mask_flat = mask.reshape(-1)                              # [BT*M]
+
+        # Build batch indices
+        batch_idx = torch.arange(BT, device=device).unsqueeze(1).expand(BT, M).reshape(-1)
+
+        # Extract only valid points
+        valid_batch = batch_idx[mask_flat]
+        valid_c = coords_flat.reshape(-1, 3)[mask_flat]
+        valid_v = values_flat.reshape(-1, 3)[mask_flat]
+
+        # Single vectorized scatter (3 channels)
+        grid = torch.zeros(BT, 3, s, s, s, device=device)
+        grid[valid_batch, 0, valid_c[:, 0], valid_c[:, 1], valid_c[:, 2]] = valid_v[:, 0]
+        grid[valid_batch, 1, valid_c[:, 0], valid_c[:, 1], valid_c[:, 2]] = valid_v[:, 1]
+        grid[valid_batch, 2, valid_c[:, 0], valid_c[:, 1], valid_c[:, 2]] = valid_v[:, 2]
 
         nobs['voxels'] = grid.reshape(B, T, 3, s, s, s)
         return nobs
