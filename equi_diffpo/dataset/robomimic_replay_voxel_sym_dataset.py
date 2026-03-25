@@ -132,6 +132,27 @@ class RobomimicReplayVoxelSymDataset(BaseImageDataset):
         episode_ends_arr = replay_buffer.episode_ends[:]
         episode_starts_arr = np.concatenate([[0], episode_ends_arr[:-1]])
 
+        # Preload all sparse voxel data into RAM to avoid torch.load() at train time
+        print(f'Preloading sparse voxel data for {n_demo} demos into RAM...')
+        voxel_ram_cache = {}  # (demo_id, frame_id) -> {'coords': tensor, 'values': tensor, 'shape': ...}
+        for demo_id in tqdm(range(n_demo), desc='Preloading voxels'):
+            demo_start = episode_starts_arr[demo_id] if demo_id < len(episode_starts_arr) else 0
+            demo_end = episode_ends_arr[demo_id] if demo_id < len(episode_ends_arr) else 0
+            n_frames = demo_end - demo_start
+            for frame_id in range(n_frames):
+                path = os.path.join(
+                    voxel_cache_dir, 'voxel',
+                    f'demo_{demo_id}', f'frame{frame_id}_voxels.pt')
+                if os.path.exists(path):
+                    data = torch.load(path, weights_only=False, map_location='cpu')
+                    voxel_ram_cache[(demo_id, frame_id)] = {
+                        'coords': data['coords'],
+                        'values': data['values'],
+                        'shape': data['shape'],
+                    }
+        print(f'Preloaded {len(voxel_ram_cache)} voxel frames into RAM.')
+
+        self.voxel_ram_cache = voxel_ram_cache
         self.replay_buffer = replay_buffer
         self.sampler = sampler
         self.shape_meta = shape_meta
@@ -156,37 +177,33 @@ class RobomimicReplayVoxelSymDataset(BaseImageDataset):
         return episode_idx, frame_idx
 
     def _load_voxel(self, demo_id, frame_id):
-        """Load sparse voxel .pt file and convert to dense grid.
+        """Convert cached sparse voxel data to dense grid.
 
         Returns torch.Tensor of shape [C, target_size, target_size, target_size] float32.
         """
-        path = os.path.join(
-            self.voxel_cache_dir, 'voxel',
-            f'demo_{demo_id}', f'frame{frame_id}_voxels.pt')
-        data = torch.load(path, weights_only=False, map_location='cpu')
-        coords = data['coords']   # [N, 3]
-        values = data['values']   # [N, 3], already in [0, 1]
+        data = self.voxel_ram_cache.get((demo_id, frame_id))
+        if data is None:
+            # Fallback to disk (shouldn't happen if preload worked)
+            path = os.path.join(
+                self.voxel_cache_dir, 'voxel',
+                f'demo_{demo_id}', f'frame{frame_id}_voxels.pt')
+            data = torch.load(path, weights_only=False, map_location='cpu')
+
+        coords = data['coords']
+        values = data['values']
         src_size = int(data['shape'][1])
 
-        if src_size != self.voxel_target_size and self.voxel_target_size < src_size:
-            # Downsample: build dense at src resolution, then pool
-            grid = torch.zeros(3, src_size, src_size, src_size)
-            grid[:, coords[:, 0].long(), coords[:, 1].long(), coords[:, 2].long()] = values.T.float()
-            factor = src_size // self.voxel_target_size
-            grid = F.avg_pool3d(grid.unsqueeze(0), kernel_size=factor).squeeze(0)
+        # Reconstruct dense grid
+        s = self.voxel_target_size
+        grid = torch.zeros(3, s, s, s)
+        if s < src_size:
+            # Build at src resolution, then downsample
+            full = torch.zeros(3, src_size, src_size, src_size)
+            full[:, coords[:, 0].long(), coords[:, 1].long(), coords[:, 2].long()] = values.T.float()
+            factor = src_size // s
+            grid = F.avg_pool3d(full.unsqueeze(0), kernel_size=factor).squeeze(0)
         else:
-            # Build dense directly at target resolution (no pool needed)
-            s = self.voxel_target_size
-            # Use sparse COO tensor for faster construction
-            N = coords.shape[0]
-            idx = torch.stack([
-                torch.arange(3).unsqueeze(1).expand(3, N).reshape(-1),
-                coords[:, 0].long().unsqueeze(0).expand(3, -1).reshape(-1),
-                coords[:, 1].long().unsqueeze(0).expand(3, -1).reshape(-1),
-                coords[:, 2].long().unsqueeze(0).expand(3, -1).reshape(-1),
-            ])  # [4, 3*N]
-            vals = values.T.float().reshape(-1)  # [3*N]
-            grid = torch.sparse_coo_tensor(idx, vals, (3, s, s, s)).to_dense()
+            grid[:, coords[:, 0].long(), coords[:, 1].long(), coords[:, 2].long()] = values.T.float()
 
         return grid
 
